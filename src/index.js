@@ -64,7 +64,9 @@ const DOMAIN_ALTERNATION = domain_whitelist
   .sort((a, b) => b.length - a.length) // 长域名优先，避免被短域名抢先匹配
   .map(d => d.replace(/\./g, '\\.'))
   .join('|');
-const REWRITE_RE = new RegExp(`(https?:)?//(${DOMAIN_ALTERNATION})(?=/|"|'|\\s|$)`, 'g');
+// 边界判定：域名后面不能紧跟字母数字、点或连字符（保证不误改 github.com.evil.com），
+// 但允许 ? # / " ' ) , ; 等任意分隔符——GitHub 的语言切换链接正是 https://github.com?locale=ja 这种形式
+const REWRITE_RE = new RegExp(`(https?:)?//(${DOMAIN_ALTERNATION})(?![\\w.-])`, 'g');
 
 // ===== 访问令牌校验 =====
 // 令牌值来自 Cloudflare Secret：ACCESS_TOKEN（代码内不含任何口令）
@@ -166,11 +168,18 @@ function checkAuth(request, url, token) {
 
   // 3) 路径前缀 /令牌/...
   const seg = url.pathname.split('/')[1] || '';
-  if (seg && isEqual(decodeURIComponent(seg), token)) return { ok: true, via: 'path', stripPrefix: true };
+  let decoded_seg = seg;
+  try { decoded_seg = decodeURIComponent(seg); } catch (e) { decoded_seg = seg; }
+  if (decoded_seg && isEqual(decoded_seg, token)) return { ok: true, via: 'path', stripPrefix: true };
 
   // 4) 查询参数（仅用于首次引导，避免出现在 Referer）
   const q = url.searchParams.get('zjkl');
   if (q && isEqual(q, token)) return { ok: true, via: 'query', stripQuery: true };
+
+  // 5) 路径尾部 ≡令牌（用户习惯的快捷写法；浏览器会把 ≡ 编码成 %E2%89%A1，两种形式都认）
+  let decoded_path = url.pathname;
+  try { decoded_path = decodeURIComponent(url.pathname); } catch (e) { decoded_path = url.pathname; }
+  if (token && decoded_path.endsWith(`≡${token}`)) return { ok: true, via: 'suffix', stripSuffix: true };
 
   return { ok: false };
 }
@@ -324,6 +333,25 @@ async function handleRequest(request, env, ctx) {
     if (auth.stripQuery) {
       url.searchParams.delete('zjkl');
     }
+    if (auth.stripSuffix) {
+      // 尾部记号可能是原文 ≡ 也可能被编码成 %E2%89%A1，统一按解码后的路径裁剪再写回
+      let decoded = url.pathname;
+      try { decoded = decodeURIComponent(url.pathname); } catch (e) { decoded = url.pathname; }
+      const suffix = `≡${token}`;
+      url.pathname = (decoded.endsWith(suffix) ? decoded.slice(0, -suffix.length) : decoded) || '/';
+    }
+    // 用一次性记号（?zjkl= 或尾部 ≡zjkl）进入时：下发 Cookie 并跳转到去掉记号的干净地址，
+    // 令牌不再留在地址栏/历史里，后续导航也无需再带记号
+    if (auth.via === 'query' || auth.via === 'suffix') {
+      return new Response(null, {
+        status: 302,
+        headers: {
+          location: url.href,
+          'set-cookie': authCookie(token, baseDomain),
+          'cache-control': 'no-store'
+        }
+      });
+    }
     // 通过 Cookie / 路径 / 查询参数授权时，顺手把该公网 IP 登记为可信，
     // 这样同 IP 下的其他设备（没有 Cookie）也能直接进入
     if (ipAuthEnabled && clientIp && auth.via !== 'ip' && auth.via !== 'header') {
@@ -369,9 +397,13 @@ async function handleRequest(request, env, ctx) {
   // 边缘缓存：命中直接返回，避免每次回源 GitHub
   // 缓存键使用剥离令牌后的干净 URL，保证所有授权方式共享同一份缓存
   const can_cache = request.method === 'GET';
+  // 带 Range 的请求（断点续传、多线程下载器）不能走缓存：
+  // Cache API 无法按范围切片，若返回缓存的完整 200 响应，续传会变成"从头重下"，
+  // 分段请求也会失效，下载器的多线程加速同样用不了
+  const has_range = request.headers.has('range');
   const edge_cache = caches.default;
   const cache_key = new Request(url.href, { method: 'GET' });
-  if (can_cache) {
+  if (can_cache && !has_range) {
     const cached_response = await edge_cache.match(cache_key);
     if (cached_response) {
       const hit_headers = new Headers(cached_response.headers);
@@ -528,7 +560,7 @@ async function handleRequest(request, env, ctx) {
     }
 
     // 写入边缘缓存（仅缓存 GET 200；删除 Set-Cookie，避免把个人会话信息缓存给其他访客）
-    if (can_cache && response.status === 200 && ctx) {
+    if (can_cache && !has_range && response.status === 200 && ctx) {
       const cached_copy = final_response.clone();
       cached_copy.headers.delete('set-cookie');
       ctx.waitUntil(edge_cache.put(cache_key, cached_copy).catch(() => {}));
