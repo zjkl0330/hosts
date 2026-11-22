@@ -1,0 +1,19 @@
+name = "gh"
+main = "src/index.js"
+compatibility_date = "2024-04-06"
+
+[vars]
+# 访问保护总开关：设为 "false" 可临时关闭全部校验
+AUTH_ENABLED = "true"
+
+# 公网 IP 授权：同一公网 IP 下有设备通过一次校验后，该 IP 的其他设备免输入
+# 注意：手机运营商 CGNAT 常是大量用户共享同一出口 IP，开启等于放宽门槛
+IP_AUTH_ENABLED = "true"
+
+# IP 授权有效期（秒），默认 7 天
+IP_AUTH_TTL = "604800"
+
+# 访问令牌 ACCESS_TOKEN 请用 Secret 设置（不要写在这里，避免明文进仓库）：
+#   npx wrangler secret put ACCESS_TOKEN
+# 也可在 Cloudflare 面板：Workers -> gh -> 设置 -> 变量和机密 中修改
+# 未设置时使用代码内默认值 zjkl
