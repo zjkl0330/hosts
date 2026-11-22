@@ -25,9 +25,18 @@ const domain_whitelist = [
   'central.github.com'
 ];
 
-// 由白名单自动生成映射
-const domain_mappings = Object.fromEntries(
-  domain_whitelist.map(domain => [domain, domain.replace(/\./g, '-') + '-'])
+// 模块加载时构建一次的反查表
+// 原始域名 -> 代理标签（github.com 用最短的 gh，其余用 xxx-gh）
+const PROXY_LABEL_BY_DOMAIN = new Map(
+  domain_whitelist.map(domain => [
+    domain,
+    domain === 'github.com' ? 'gh' : `${domain.replace(/\./g, '-')}-gh`
+  ])
+);
+
+// 代理前缀 -> 原始域名（替代每次请求线性遍历白名单）
+const HOST_BY_PREFIX = new Map(
+  [...PROXY_LABEL_BY_DOMAIN].map(([domain, label]) => [`${label}.`, domain])
 );
 
 
@@ -42,24 +51,20 @@ const enable_geo_redirect = false;
 // 边缘缓存时长（秒）：HTML 页面较短以保证内容新鲜度，静态资源较长
 // 静态资源路径含内容哈希，长缓存是安全的；缓存越久，重复访问越少打到 Worker，节省请求额度
 const CACHE_TTL_HTML = 300;
-const CACHE_TTL_ASSET = 86400;
+const CACHE_TTL_ASSET = 30 * 24 * 60 * 60;
 
 // 文本改写的大小上限：超大 JS/CSS/JSON 跳过改写，避免消耗过多 CPU 时间
 // （HTML 不受限制，必须改写以保证站内链接走代理）
 const MAX_REWRITE_BYTES = 512 * 1024;
 
-// 预编译改写规则：避免每个请求重复构造 40 个 RegExp（显著降低 CPU 消耗）
-const REWRITE_RULES = domain_whitelist.map(domain => {
-  const escaped = domain.replace(/\./g, '\\.');
-  return {
-    domain,
-    proxyLabel: domain === 'github.com'
-      ? 'gh'
-      : `${domain.replace(/\./g, '-')}-gh`,
-    urlRe: new RegExp(`https?://${escaped}(?=/|"|'|\\s|$)`, 'g'),
-    protoRe: new RegExp(`//${escaped}(?=/|"|'|\\s|$)`, 'g')
-  };
-});
+// 合并成一条正则：原先 24 个域名 × 2 条规则 = 48 次全文扫描，
+// 现在整段文本只扫描 1 次，改写 CPU 消耗下降一个数量级
+const DOMAIN_ALTERNATION = domain_whitelist
+  .slice()
+  .sort((a, b) => b.length - a.length) // 长域名优先，避免被短域名抢先匹配
+  .map(d => d.replace(/\./g, '\\.'))
+  .join('|');
+const REWRITE_RE = new RegExp(`(https?:)?//(${DOMAIN_ALTERNATION})(?=/|"|'|\\s|$)`, 'g');
 
 // ===== 访问令牌校验 =====
 // 令牌值来自 Cloudflare Secret：ACCESS_TOKEN（代码内不含任何口令）
@@ -412,6 +417,18 @@ async function handleRequest(request, env, ctx) {
   new_headers.set('Referer', new_url.href);
   // 强制要求源站返回未压缩的内容，确保我们可以正常修改文本
   new_headers.delete('accept-encoding');
+
+  // 向上游转发前剔除本代理自己的授权 Cookie，避免密钥泄露给第三方
+  const upstream_cookie = new_headers.get('cookie');
+  if (upstream_cookie && upstream_cookie.indexOf(`${COOKIE_NAME}=`) !== -1) {
+    const kept = upstream_cookie
+      .split(';')
+      .filter(pair => !pair.trim().startsWith(`${COOKIE_NAME}=`))
+      .join(';')
+      .trim();
+    if (kept) new_headers.set('cookie', kept);
+    else new_headers.delete('cookie');
+  }
   
   try {
     // 发起请求
@@ -541,61 +558,30 @@ function getProxyPrefix(host) {
 
 // 根据主机前缀解析目标 GitHub 域名
 function resolveTargetHost(host_prefix) {
-  // 短前缀 gh. -> github.com
-  if (host_prefix === 'gh.') {
-    return 'github.com';
-  }
-  // 通配后缀 *-gh. -> 对应原始域名
-  if (host_prefix && host_prefix.endsWith('-gh.')) {
-    const prefix_part = host_prefix.slice(0, -4); // 移除 -gh.
-    for (const original of Object.keys(domain_mappings)) {
-      const normalized_original = original.trim().toLowerCase();
-      if (normalized_original.replace(/\./g, '-') === prefix_part) {
-        return original;
-      }
-    }
-  }
-  return null;
+  // 短前缀 gh. -> github.com，其余 *-gh. -> 对应原始域名，均为模块级查表
+  return HOST_BY_PREFIX.get(host_prefix) || null;
 }
 
 // 修改文本中的域名引用
 function modifyText(text, host_prefix, effective_hostname) {
-  // 快速前置判断：内容完全不含 github 时直接返回，省掉全部正则扫描
-  if (text.indexOf('github') === -1) {
-    return text;
-  }
-
-  // 使用有效主机名获取域名后缀部分（用于构建完整的代理域名）
   const domain_suffix = effective_hostname.substring(host_prefix.length);
 
-  // 使用模块级预编译正则，避免每个请求重复构造
-  for (const rule of REWRITE_RULES) {
-    const full_proxy_domain = `${rule.proxyLabel}.${domain_suffix}`;
-
-    // 替换完整 URLs
-    text = text.replace(rule.urlRe, `https://${full_proxy_domain}`);
-
-    // 替换协议相对 URLs
-    text = text.replace(rule.protoRe, `//${full_proxy_domain}`);
-  }
-
-  return text;
+  // 单次扫描完成全部域名替换
+  return text.replace(REWRITE_RE, (match, scheme, domain) => {
+    const label = PROXY_LABEL_BY_DOMAIN.get(domain);
+    if (!label) return match;
+    // 带协议的统一升级为 https，协议相对的保持相对
+    return `${scheme ? 'https://' : '//'}${label}.${domain_suffix}`;
+  });
 }
 
 // 修改 URL（用于重定向等）
 function modifyUrl(url_str, host_prefix, effective_hostname) {
   try {
     const url = new URL(url_str);
-    const domain_suffix = effective_hostname.substring(host_prefix.length);
-    
-    for (const [original_domain, _] of Object.entries(domain_mappings)) {
-      if (url.host === original_domain) {
-        url.host = original_domain === 'github.com'
-          ? `gh.${domain_suffix}`
-          : `${original_domain.replace(/\./g, '-')}-gh.${domain_suffix}`;
-        break;
-      }
-    }
+    const label = PROXY_LABEL_BY_DOMAIN.get(url.hostname.toLowerCase());
+    if (!label) return url_str;
+    url.host = `${label}.${effective_hostname.substring(host_prefix.length)}`;
     return url.href;
   } catch (e) {
     return url_str;
