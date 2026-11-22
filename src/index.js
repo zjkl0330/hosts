@@ -741,7 +741,7 @@ function modifyText(text, host_prefix, effective_hostname) {
   const domain_suffix = effective_hostname.substring(host_prefix.length);
 
   // 单次扫描完成全部域名替换（含 URL 编码形式）
-  return text.replace(REWRITE_RE, (match, scheme, domain) => {
+  const out = text.replace(REWRITE_RE, (match, scheme, domain) => {
     const label = PROXY_LABEL_BY_DOMAIN.get(domain.toLowerCase());
     if (!label) return match;
     // 编码形式要保持编码：https%3A%2F%2Fgithub.com -> https%3A%2F%2Fgh.xxx
@@ -749,6 +749,17 @@ function modifyText(text, host_prefix, effective_hostname) {
     const head = scheme ? (encoded ? 'https%3A' : 'https:') : '';
     return `${head}${encoded ? '%2F%2F' : '//'}${label}.${domain_suffix}`;
   });
+
+  // GitHub 前端脚本会读这两个 meta 判断"是否在官方域名"，
+  // 一旦发现当前主机名与 content 不符，就强制跳回 github.com（这就是"打开就跳走"的根因）。
+  // 必须把它们的值改成当前代理主机，页面才会留在代理内。
+  return out.replace(
+    /(<meta\s+name="(?:expected-)?hostname"\s+content=")([^"]*)(")/gi,
+    (match, head, host, tail) => {
+      const label = PROXY_LABEL_BY_DOMAIN.get(host.toLowerCase().trim());
+      return label ? `${head}${label}.${domain_suffix}${tail}` : match;
+    }
+  );
 }
 
 // 修改 URL（用于重定向等）
