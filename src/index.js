@@ -672,7 +672,13 @@ async function handleRequest(request, env, ctx) {
     const rewrite_ok = is_html || !declared_length || declared_length <= MAX_REWRITE_BYTES;
 
     let final_response;
-    if (response.status === 200 && is_text && rewrite_ok) {
+    // 注意：4xx/5xx 的 HTML 也必须改写。GitHub 的错误页同样带
+    // <meta name="expected-hostname" content="github.com">，原样透传会让前端脚本
+    // 立刻跳回官方域名。只有 204/304 没有正文，跳过。
+    const has_body = response.status !== 204 && response.status !== 304;
+    const should_rewrite = has_body && is_text && rewrite_ok &&
+      (response.status === 200 || is_html);
+    if (should_rewrite) {
       // 如果要修改内容，必须移除这些头，因为内容会被解压且长度会变化
       new_response_headers.delete('content-encoding');
       new_response_headers.delete('content-length');
@@ -751,15 +757,17 @@ function modifyText(text, host_prefix, effective_hostname) {
   });
 
   // GitHub 前端脚本会读这两个 meta 判断"是否在官方域名"，
-  // 一旦发现当前主机名与 content 不符，就强制跳回 github.com（这就是"打开就跳走"的根因）。
-  // 必须把它们的值改成当前代理主机，页面才会留在代理内。
-  return out.replace(
-    /(<meta\s+name="(?:expected-)?hostname"\s+content=")([^"]*)(")/gi,
-    (match, head, host, tail) => {
+  // 一旦发现当前主机名与 content 不符，就强制跳回 github.com（"打开就跳走"的根因）。
+  // 逐个扫描 <meta> 标签，不依赖属性顺序（name 可能在 content 之后）。
+  return out.replace(/<meta\b[^>]*>/gi, (tag) => {
+    const name = tag.match(/\bname\s*=\s*["']([^"']*)["']/i);
+    if (!name) return tag;
+    if (!/^(?:expected-)?hostname$/i.test(name[1].trim())) return tag;
+    return tag.replace(/(\bcontent\s*=\s*["'])([^"']*)(["'])/i, (m, head, host, tail) => {
       const label = PROXY_LABEL_BY_DOMAIN.get(host.toLowerCase().trim());
-      return label ? `${head}${label}.${domain_suffix}${tail}` : match;
-    }
-  );
+      return label ? `${head}${label}.${domain_suffix}${tail}` : m;
+    });
+  });
 }
 
 // 修改 URL（用于重定向等）
