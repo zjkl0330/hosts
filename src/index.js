@@ -17,6 +17,7 @@ const domain_whitelist = [
   'www.githubstatus.com',
   'npmjs.com',
   'git-lfs.github.com',
+  'media.githubusercontent.com',
   'githubusercontent.com',
   'github.global.ssl.fastly.net',
   'api.npms.io',
@@ -62,6 +63,40 @@ const CACHE_TTL_ASSET = 30 * 24 * 60 * 60;
 // 文本改写的大小上限：超大 JS/CSS/JSON 跳过改写，避免消耗过多 CPU 时间
 // （HTML 不受限制，必须改写以保证站内链接走代理）
 const MAX_REWRITE_BYTES = 512 * 1024;
+
+// 回源控制：超时避免请求挂死白占 CPU；5xx/网络错误重试一次提高成功率（4xx 不重试）
+const UPSTREAM_TIMEOUT_MS = 30000;
+const UPSTREAM_RETRIES = 1;
+// 边缘保留期 = 新鲜期 × 该倍数，过期副本用于回源失败时兜底
+const STALE_FACTOR = 4;
+
+// 路径感知缓存分级：不可变资源长缓存，动态页面短缓存
+// 比"HTML 一律 5 分钟"更省回源——分支归档/发布包重复下载率极高
+function cacheTtlFor(pathname, is_html) {
+  if (/\/(releases\/download|archive|codeload)\//.test(pathname)) return CACHE_TTL_ASSET;
+  if (/\/(commits?|issues|pulls|compare|pulse|activity)\b/.test(pathname)) return 60;
+  if (/\/(blob|tree)\//.test(pathname)) return 600;
+  return is_html ? CACHE_TTL_HTML : CACHE_TTL_ASSET;
+}
+
+// 回源请求：带超时与重试。5xx 与网络异常重试，4xx 直接返回（重试无意义且浪费配额）
+async function fetchUpstream(target, options) {
+  // 有请求体（POST/PUT）时不能重试：流已被消费，重发会直接抛错
+  const max_retries = options.body === undefined ? UPSTREAM_RETRIES : 0;
+  for (let i = 0; ; i++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
+    try {
+      const r = await fetch(target, { ...options, signal: controller.signal });
+      if (r.status < 500 || i >= max_retries) return r;
+    } catch (err) {
+      if (i >= max_retries) throw err;
+    } finally {
+      clearTimeout(timer);
+    }
+    await new Promise(resolve => setTimeout(resolve, 400 * (i + 1)));
+  }
+}
 
 // 合并成一条正则：原先 24 个域名 × 2 条规则 = 48 次全文扫描，
 // 现在整段文本只扫描 1 次，改写 CPU 消耗下降一个数量级
@@ -248,7 +283,7 @@ export default {
 };
 
 async function handleRequest(request, env, ctx) {
-  const url = new URL(request.url);
+  let url = new URL(request.url);
   // 统一转小写
   const current_host = url.host.toLowerCase();
   const host_header = request.headers.get('Host');
@@ -402,6 +437,19 @@ async function handleRequest(request, env, ctx) {
     return Response.redirect(url.href);
   }
 
+  // 直连形式：/<https://github.com/user/repo/...>，粘贴原链接即可用（gh-proxy 风格）
+  // 注意：Cloudflare 边缘会把路径里的 // 折叠成 /，所以兼容 https:// 与 https:/ 两种形态
+  let direct_target = null;
+  const direct_match = url.pathname.match(/^\/(https?):\/{0,2}([^/].*)$/);
+  if (direct_match) {
+    try {
+      const candidate = new URL(`${direct_match[1]}://${direct_match[2]}${url.search || ''}`);
+      if (domain_whitelist.includes(candidate.hostname.toLowerCase())) direct_target = candidate;
+    } catch (e) {
+      direct_target = null;
+    }
+  }
+
   // 边缘缓存：命中直接返回，避免每次回源 GitHub
   // 缓存键使用剥离令牌后的干净 URL，保证所有授权方式共享同一份缓存
   const can_cache = request.method === 'GET';
@@ -410,16 +458,24 @@ async function handleRequest(request, env, ctx) {
   // 分段请求也会失效，下载器的多线程加速同样用不了
   const has_range = request.headers.has('range');
   const edge_cache = caches.default;
-  const cache_key = new Request(url.href, { method: 'GET' });
+  const cache_target = direct_target || url;
+  const cache_key = new Request(cache_target.href, { method: 'GET' });
+  let stale_response = null;
   if (can_cache && !has_range) {
     const cached_response = await edge_cache.match(cache_key);
     if (cached_response) {
-      const hit_headers = new Headers(cached_response.headers);
-      hit_headers.set('x-edge-cache', 'HIT');
-      return new Response(cached_response.body, {
-        status: cached_response.status,
-        headers: hit_headers
-      });
+      // 超过新鲜期但仍在保留期内的副本，留作回源失败时兜底
+      const stored_at = Number(cached_response.headers.get('x-stored-at') || 0) * 1000;
+      const fresh = cacheTtlFor(cache_target.pathname, (cached_response.headers.get('content-type') || '').includes('text/html')) * 1000;
+      if (!stored_at || Date.now() - stored_at < fresh) {
+        const hit_headers = new Headers(cached_response.headers);
+        hit_headers.set('x-edge-cache', 'HIT');
+        return new Response(cached_response.body, {
+          status: cached_response.status,
+          headers: hit_headers
+        });
+      }
+      stale_response = cached_response;
     }
   }
 
@@ -429,11 +485,13 @@ async function handleRequest(request, env, ctx) {
     return new Response(`Domain not configured for proxy. Host: ${effective_host}, Prefix check failed`, { status: 404 });
   }
 
-  // 根据前缀找到对应的原始域名
-  const target_host = resolveTargetHost(host_prefix);
+  // 根据前缀找到对应的原始域名（直连形式直接取其主机名）
+  const target_host = direct_target ? direct_target.hostname : resolveTargetHost(host_prefix);
   if (!target_host) {
     return new Response(`Domain not configured for proxy. Host: ${effective_host}, Prefix: ${host_prefix}, Target lookup failed`, { status: 404 });
   }
+  // 直连形式后续复用同一套流程：路径、查询参数、改写、缓存全部照常
+  if (direct_target) url = direct_target;
 
   // 直接使用正则表达式处理最常见的嵌套URL问题
   let pathname = url.pathname;
@@ -472,13 +530,20 @@ async function handleRequest(request, env, ctx) {
   
   try {
     // 发起请求
-    let response = await fetch(new_url.href, {
+    let response = await fetchUpstream(new_url.href, {
       method: request.method,
       headers: new_headers,
       body: request.method !== 'GET' ? request.body : undefined,
       redirect: 'manual' // 处理重定向，避免自动跟随导致的问题
       // 注意：不使用 cf.cacheEverything，避免把源站临时的 404/错误页也缓存住
     });
+
+    // 源站持续 5xx（重试后仍失败）时，用边缘的过期副本兜底，避免用户看到错误页
+    if (response.status >= 500 && stale_response) {
+      const stale_headers = new Headers(stale_response.headers);
+      stale_headers.set('x-edge-cache', 'STALE');
+      return new Response(stale_response.body, { status: stale_response.status, headers: stale_headers });
+    }
 
     // 处理重定向
     if ([301, 302, 303, 307, 308].includes(response.status)) {
@@ -493,7 +558,7 @@ async function handleRequest(request, env, ctx) {
           const follow_headers = new Headers(new_headers);
           follow_headers.set('Host', loc.host);
           follow_headers.set('Referer', loc.href);
-          response = await fetch(loc.href, {
+          response = await fetchUpstream(loc.href, {
             method: 'GET',
             headers: follow_headers,
             redirect: 'manual'
@@ -530,10 +595,11 @@ async function handleRequest(request, env, ctx) {
                     content_type.includes('application/javascript') || 
                     content_type.includes('application/xml');
 
-    // 缓存时长：HTML 5 分钟（兼顾内容新鲜度），其他静态资源 1 天
+    // 缓存时长按路径分级：发布包/归档 30 天，动态页面 60 秒，普通 HTML 5 分钟
     const is_html = content_type.includes('text/html');
+    const resp_ttl = cacheTtlFor(new_url.pathname, is_html);
     if (response.status === 200) {
-      new_response_headers.set('cache-control', `public, max-age=${is_html ? CACHE_TTL_HTML : CACHE_TTL_ASSET}`);
+      new_response_headers.set('cache-control', `public, max-age=${resp_ttl}`);
       new_response_headers.set('x-edge-cache', 'MISS');
     }
 
@@ -571,11 +637,20 @@ async function handleRequest(request, env, ctx) {
     if (can_cache && !has_range && response.status === 200 && ctx) {
       const cached_copy = final_response.clone();
       cached_copy.headers.delete('set-cookie');
+      // 边缘保留期比新鲜期长 STALE_FACTOR 倍：过期的副本可在回源失败时兜底
+      cached_copy.headers.set('cache-control', `public, max-age=${resp_ttl * STALE_FACTOR}`);
+      cached_copy.headers.set('x-stored-at', String(Math.floor(Date.now() / 1000)));
       ctx.waitUntil(edge_cache.put(cache_key, cached_copy).catch(() => {}));
     }
 
     return final_response;
   } catch (err) {
+    // 网络异常/超时：有边缘副本就兜底返回，避免直接给用户错误页
+    if (stale_response) {
+      const stale_headers = new Headers(stale_response.headers);
+      stale_headers.set('x-edge-cache', 'STALE');
+      return new Response(stale_response.body, { status: stale_response.status, headers: stale_headers });
+    }
     return new Response(`Proxy Error: ${err.message}`, { status: 502 });
   }
 }
