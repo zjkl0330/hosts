@@ -123,7 +123,26 @@ const LOGIN_PATH = '/__zjkl_login';
 // ===== 公网 IP 授权：同 IP 下所有设备免输入 =====
 // 任何设备在该 IP 下通过一次校验后，记住这个 IP，同 IP 的其他设备直接放行
 const IP_GRANT_PATH = '/__ipgrant/';
-const DEFAULT_IP_TTL = 7 * 24 * 60 * 60; // 默认 7 天
+const DEFAULT_IP_TTL = 30 * 24 * 60 * 60; // 默认 30 天
+
+// 按网段登记，而不是按单个 IP：
+// 移动流量/家庭宽带常在同一个地址池内轮换出口 IP，逐 IP 登记会导致频繁重新验证
+// 默认 IPv4 放宽到 /16、IPv6 到 /48（可用环境变量 IP_SCOPE_V4 / IP_SCOPE_V6 调整）
+let ipScopeV4 = 16;
+let ipScopeV6 = 48;
+
+function ipScope(ip) {
+  if (!ip) return '';
+  if (ip.includes(':')) {
+    const keep = Math.min(4, Math.ceil(ipScopeV6 / 16));
+    return `${ip.split(':').slice(0, keep).join(':')}::/${ipScopeV6}`;
+  }
+  const parts = ip.split('.');
+  if (parts.length !== 4) return ip;
+  const keep = Math.floor(ipScopeV4 / 8);
+  if (keep >= 4) return ip;
+  return `${parts.slice(0, keep).join('.')}${keep ? '.' : ''}0/${ipScopeV4}`;
+}
 
 // 取主域（Cookie 作用域与回跳校验用），兼容 dpdns.org 这类公共后缀
 function parentDomain(host) {
@@ -138,16 +157,43 @@ function getClientIp(request) {
   return request.headers.get('CF-Connecting-IP') || '';
 }
 
-// 用 Cache API 存 IP 凭证：无需新建 KV 命名空间，也不消耗请求额度
+// 用 KV 存网段凭证：Cache API 是「按边缘节点」存储的，不同节点互相看不到，
+// 会导致同一网段时通时不通（实测确认），所以优先用 KV（全局一致），未绑定时退回 Cache API
+// grantedScopes 是 isolate 内的短期记忆，用来把 KV 读写压到每个网段各一次
+let ipKv = null;
+const grantedScopes = new Set();
+
+function setIpStore(env) {
+  ipKv = (env && env.KV_IPGRANT) || null;
+  const v4 = parseInt((env && env.IP_SCOPE_V4) || '', 10);
+  const v6 = parseInt((env && env.IP_SCOPE_V6) || '', 10);
+  ipScopeV4 = v4 >= 8 && v4 <= 32 ? v4 : 16;
+  ipScopeV6 = v6 >= 16 && v6 <= 64 ? v6 : 48;
+}
+
 function ipGrantKey(ip, base) {
-  return new Request(`https://${base}${IP_GRANT_PATH}${encodeURIComponent(ip)}`, { method: 'GET' });
+  return new Request(`https://${base}${IP_GRANT_PATH}${encodeURIComponent(ipScope(ip))}`, { method: 'GET' });
 }
 
 async function hasIpGrant(ip, base) {
   if (!ip) return false;
+  const scope = ipScope(ip);
+  if (!scope) return false;
+  if (grantedScopes.has(scope)) return true;
   try {
+    if (ipKv) {
+      if (await ipKv.get(scope)) {
+        grantedScopes.add(scope);
+        return true;
+      }
+      return false;
+    }
     const r = await caches.default.match(ipGrantKey(ip, base));
-    return !!r;
+    if (r) {
+      grantedScopes.add(scope);
+      return true;
+    }
+    return false;
   } catch (e) {
     return false;
   }
@@ -155,6 +201,13 @@ async function hasIpGrant(ip, base) {
 
 function grantIp(ctx, ip, ttl, base) {
   if (!ip || !ctx) return;
+  const scope = ipScope(ip);
+  if (!scope || grantedScopes.has(scope)) return;
+  grantedScopes.add(scope);
+  if (ipKv) {
+    ctx.waitUntil(ipKv.put(scope, '1', { expirationTtl: Math.max(60, ttl) }).catch(() => {}));
+    return;
+  }
   const resp = new Response('1', {
     headers: { 'content-type': 'text/plain', 'cache-control': `public, max-age=${ttl}` }
   });
@@ -164,12 +217,21 @@ function grantIp(ctx, ip, ttl, base) {
 // 同步写入（登录时使用，便于立即校验写入是否成功）
 async function grantIpNow(ip, ttl, base) {
   if (!ip) return false;
-  const resp = new Response('1', {
-    headers: { 'content-type': 'text/plain', 'cache-control': `public, max-age=${ttl}` }
-  });
+  const scope = ipScope(ip);
+  if (!scope) return false;
   try {
+    if (ipKv) {
+      await ipKv.put(scope, '1', { expirationTtl: Math.max(60, ttl) });
+      grantedScopes.add(scope);
+      return !!(await ipKv.get(scope));
+    }
+    const resp = new Response('1', {
+      headers: { 'content-type': 'text/plain', 'cache-control': `public, max-age=${ttl}` }
+    });
     await caches.default.put(ipGrantKey(ip, base), resp);
-    return await hasIpGrant(ip, base);
+    const ok = await hasIpGrant(ip, base);
+    if (ok) grantedScopes.add(scope);
+    return ok;
   } catch (e) {
     return false;
   }
@@ -283,6 +345,7 @@ export default {
 };
 
 async function handleRequest(request, env, ctx) {
+  setIpStore(env);
   let url = new URL(request.url);
   // 统一转小写
   const current_host = url.host.toLowerCase();
@@ -395,14 +458,10 @@ async function handleRequest(request, env, ctx) {
         }
       });
     }
-    // 通过 Cookie / 路径 / 查询参数授权时，顺手把该公网 IP 登记为可信，
-    // 这样同 IP 下的其他设备（没有 Cookie）也能直接进入
-    if (ipAuthEnabled && clientIp && auth.via !== 'ip' && auth.via !== 'header') {
-      const dest = request.headers.get('Sec-Fetch-Dest') || '';
-      const accept = request.headers.get('Accept') || '';
-      if (dest === 'document' || accept.includes('text/html')) {
-        grantIp(ctx, clientIp, ipTtl, baseDomain);
-      }
+    // 任何方式授权成功后都登记网段（含 git/curl 的请求头方式），
+    // 这样同网段下的其他设备（没有 Cookie）也能直接进入，无需再输密钥
+    if (ipAuthEnabled && clientIp && auth.via !== 'ip') {
+      grantIp(ctx, clientIp, ipTtl, baseDomain);
     }
   }
   
