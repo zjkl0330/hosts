@@ -22,7 +22,13 @@ const domain_whitelist = [
   'api.npms.io',
   'github.community',
   'desktop.github.com',
-  'central.github.com'
+  'central.github.com',
+  // 文档/帮助类子站：不加入白名单时，点击页面里的 Docs/Help/Support 会离开代理直连
+  'docs.github.com',
+  'support.github.com',
+  'skills.github.com',
+  'learn.github.com',
+  'help.github.com'
 ];
 
 // 模块加载时构建一次的反查表
@@ -66,7 +72,9 @@ const DOMAIN_ALTERNATION = domain_whitelist
   .join('|');
 // 边界判定：域名后面不能紧跟字母数字、点或连字符（保证不误改 github.com.evil.com），
 // 但允许 ? # / " ' ) , ; 等任意分隔符——GitHub 的语言切换链接正是 https://github.com?locale=ja 这种形式
-const REWRITE_RE = new RegExp(`(https?:)?//(${DOMAIN_ALTERNATION})(?![\\w.-])`, 'g');
+// 同时兼容 URL 编码形式（https%3A%2F%2Fgithub.com），这是 GitHub 登录回跳地址的常见写法，
+// 不改写会导致登录成功后被打回真实 github.com
+const REWRITE_RE = new RegExp(`((?:https?)(?::|%3A))?(?://|%2F%2F)(${DOMAIN_ALTERNATION})(?![\\w.-])`, 'gi');
 
 // ===== 访问令牌校验 =====
 // 令牌值来自 Cloudflare Secret：ACCESS_TOKEN（代码内不含任何口令）
@@ -598,12 +606,14 @@ function resolveTargetHost(host_prefix) {
 function modifyText(text, host_prefix, effective_hostname) {
   const domain_suffix = effective_hostname.substring(host_prefix.length);
 
-  // 单次扫描完成全部域名替换
+  // 单次扫描完成全部域名替换（含 URL 编码形式）
   return text.replace(REWRITE_RE, (match, scheme, domain) => {
-    const label = PROXY_LABEL_BY_DOMAIN.get(domain);
+    const label = PROXY_LABEL_BY_DOMAIN.get(domain.toLowerCase());
     if (!label) return match;
-    // 带协议的统一升级为 https，协议相对的保持相对
-    return `${scheme ? 'https://' : '//'}${label}.${domain_suffix}`;
+    // 编码形式要保持编码：https%3A%2F%2Fgithub.com -> https%3A%2F%2Fgh.xxx
+    const encoded = /%2f%2f/i.test(match);
+    const head = scheme ? (encoded ? 'https%3A' : 'https:') : '';
+    return `${head}${encoded ? '%2F%2F' : '//'}${label}.${domain_suffix}`;
   });
 }
 
