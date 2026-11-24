@@ -124,6 +124,8 @@ const LOGIN_PATH = '/__zjkl_login';
 // 任何设备在该 IP 下通过一次校验后，记住这个 IP，同 IP 的其他设备直接放行
 const IP_GRANT_PATH = '/__ipgrant/';
 const DEFAULT_IP_TTL = 30 * 24 * 60 * 60; // 默认 30 天
+// 构建标识：用于确认浏览器/边缘是否拿到了最新版本（响应头 x-zjkl-build）
+const BUILD = '2026-11-24-c';
 
 // 按网段登记，而不是按单个 IP：
 // 移动流量/家庭宽带常在同一个地址池内轮换出口 IP，逐 IP 登记会导致频繁重新验证
@@ -496,6 +498,25 @@ async function handleRequest(request, env, ctx) {
     return Response.redirect(url.href);
   }
 
+  // 诊断端点：用于确认浏览器/边缘拿到的是哪个版本、走了哪种授权
+  // 注意：必须放在 auth 计算之后，否则会因变量未初始化抛错（1101）
+  if (url.pathname === '/__z') {
+    const client_ip = getClientIp(request);
+    const info = {
+      build: BUILD,
+      country: request.headers.get('CF-IPCountry') || '',
+      colo: (request.cf && request.cf.colo) || '',
+      client_ip,
+      ip_scope: ipScope(client_ip),
+      authorized: !!auth.ok,
+      via: auth.via || '',
+      user_agent: (request.headers.get('User-Agent') || '').slice(0, 80)
+    };
+    return new Response(JSON.stringify(info, null, 2), {
+      headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'x-zjkl-build': BUILD }
+    });
+  }
+
   // 直连形式：/<https://github.com/user/repo/...>，粘贴原链接即可用（gh-proxy 风格）
   // 注意：Cloudflare 边缘会把路径里的 // 折叠成 /，所以兼容 https:// 与 https:/ 两种形态
   let direct_target = null;
@@ -658,9 +679,12 @@ async function handleRequest(request, env, ctx) {
     const is_html = content_type.includes('text/html');
     const resp_ttl = cacheTtlFor(new_url.pathname, is_html);
     if (response.status === 200) {
-      new_response_headers.set('cache-control', `public, max-age=${resp_ttl}`);
+      // HTML 不让浏览器缓存（每次回源到边缘缓存校验），否则旧版本的页面可能长期留在本地，
+      // 而旧页面的 meta 指向 github.com，一打开就被脚本跳走
+      new_response_headers.set('cache-control', is_html ? 'no-cache' : `public, max-age=${resp_ttl}`);
       new_response_headers.set('x-edge-cache', 'MISS');
     }
+    new_response_headers.set('x-zjkl-build', BUILD);
 
     // 已授权访问时顺带续期 Cookie（滑动过期），保证设备长期免输入
     if (authEnabled && auth.ok && auth.via === 'cookie' && is_html) {
